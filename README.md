@@ -4,7 +4,7 @@ OpenPCC is an open-source framework for provably private AI inference, inspired 
 
 OpenPCC is designed to become a transparent, community-governed standard for AI data privacy.
 
-Read the OpenPCC Whitepaper: https://github.com/openpcc/openpcc/whitepaper/openpcc.pdf
+Read the OpenPCC Whitepaper: https://github.com/openpcc/openpcc/blob/main/whitepaper/openpcc.pdf
 
 ## OpenPCC Client
 
