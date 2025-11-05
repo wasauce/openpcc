@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 
@@ -303,7 +302,7 @@ type TPMConfig struct {
 	SimulatorPlatformAddress string `yaml:"simulator_platform_address"`
 }
 
-func collectFakeTPMEvidence() (evidence.SignedEvidenceList, error) {
+func collectFakeTPMEvidence(tpmOperator *TPMOperator) (evidence.SignedEvidenceList, error) {
 	ctx := context.Background()
 
 	tpmConfig := &TPMConfig{
@@ -313,24 +312,6 @@ func collectFakeTPMEvidence() (evidence.SignedEvidenceList, error) {
 		REKCreationHashHandle:   0x01c0000B,
 		AttestationKeyHandle:    0x81000003,
 	}
-
-	tpmOperator := &TPMOperator{
-		childKeyHandle:          0x81000000,
-		primaryKeyHandle:        0x81010001,
-		rekCreationTicketHandle: 0x01c0000A,
-		rekCreationHashHandle:   0x01c0000B,
-		attestationKeyHandle:    0x81000003,
-		device:                  NewTPMInMemorySimulator(),
-	}
-
-	err := setupTPM(ctx, tpmOperator)
-	if err != nil {
-		slog.Error("TPM setup failed", "error", err)
-		return evidence.SignedEvidenceList{}, err
-	}
-	defer func() {
-		err = errors.Join(err, tpmOperator.Close())
-	}()
 
 	slog.InfoContext(ctx, "Preparing attestation evidence")
 

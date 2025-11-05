@@ -30,8 +30,26 @@ type RouterComConfig struct {
 func main() {
 	fmt.Println("Computing")
 
+	tpmOperator := &TPMOperator{
+		childKeyHandle:          0x81000000,
+		primaryKeyHandle:        0x81010001,
+		rekCreationTicketHandle: 0x01c0000A,
+		rekCreationHashHandle:   0x01c0000B,
+		attestationKeyHandle:    0x81000003,
+		device:                  NewTPMInMemorySimulator(),
+	}
+
+	err := setupTPM(context.Background(), tpmOperator)
+	if err != nil {
+		slog.Error("TPM setup failed", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		err = errors.Join(err, tpmOperator.Close())
+	}()
+
 	// generate fake attestation
-	evidence, err := collectFakeTPMEvidence()
+	evidence, err := collectFakeTPMEvidence(tpmOperator)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
@@ -47,15 +65,15 @@ func main() {
 		RouterCom: DefaultConfig(),
 		RouterAgent: &agent.Config{
 			Tags:               []string{"test-model"},
-			NodeTargetURL:      "http://localhost:3500/generate",
-			NodeHealthcheckURL: "http://localhost:3500/_health",
+			NodeTargetURL:      "http://localhost:3700/generate",
+			NodeHealthcheckURL: "http://localhost:3700/_health",
 			HeartbeatInterval:  1 * time.Minute,
-			RouterBaseURL:      "http://localhost:3400",
+			RouterBaseURL:      "http://localhost:3600",
 		},
 		Models: []string{"test-model"},
 	}
 
-	cfg.HTTP.Port = "3500"
+	cfg.HTTP.Port = "3700"
 
 	if len(cfg.Models) == 0 {
 		slog.Error("Invalid config: no models provided")
@@ -66,7 +84,7 @@ func main() {
 	}
 
 	// setup routercom as an http app
-	rtrcom, err := NewRouterCom(cfg.RouterCom, evidence)
+	rtrcom, err := NewRouterCom(cfg.RouterCom, evidence, *tpmOperator.device.tpmHandle)
 	if err != nil {
 		slog.Error("failed to create routercom service", "error", err)
 		os.Exit(1)

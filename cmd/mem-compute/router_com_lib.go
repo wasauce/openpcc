@@ -16,25 +16,35 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/cloudflare/circl/hpke"
+	"github.com/cloudflare/circl/kem"
+	"github.com/confidentsecurity/twoway"
 	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/tpm2/transport"
+	"github.com/google/go-tpm/tpmutil"
 	"github.com/openpcc/openpcc/ahttp"
 	ev "github.com/openpcc/openpcc/attestation/evidence"
 	"github.com/openpcc/openpcc/httpfmt"
 	"github.com/openpcc/openpcc/messages"
 	"github.com/openpcc/openpcc/otel/otelutil"
 	"github.com/openpcc/openpcc/router/api"
+	opcctpm "github.com/openpcc/openpcc/tpm"
 	tpmhpke "github.com/openpcc/openpcc/tpm/hpke"
 	"go.opentelemetry.io/otel/codes"
 )
@@ -82,7 +92,7 @@ func DefaultConfig() *RCSConfig {
 		TPM: &TPM{
 			Simulate:  false,
 			Device:    defaultTPMDevice,
-			REKHandle: 0,
+			REKHandle: 0x81000000,
 		},
 		Worker: &WorkerConfig{
 			BinaryPath: "",
@@ -110,42 +120,48 @@ func (s *RouterComService) generateHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Call worker stuff to run the stuff.
-	fmt.Println("HANDE REWUES", requestParams)
+	// decode required inputs
+	adapter := newTPMSuiteAdapter(r.Context(), s)
+	receiver, err := twoway.NewMultiRequestReceiverWithCustomSuite(adapter, 0, nil, rand.Reader) // nil priv key since we're using the TPM.
+	if err != nil {
+		otelutil.RecordError2(span, fmt.Errorf("failed to create multi request receiver: %w", err))
+		httpfmt.BinaryBadRequest(w, r, err.Error())
+		return
+	}
 
-	// decode
+	req, opener, err := messages.DecapsulateRequest(ctx, receiver, requestParams.EncapsulatedKey, requestParams.MediaType, r.Body)
+	if err != nil {
+		otelutil.RecordError2(span, fmt.Errorf("failed to decapsulate request: %w", err))
+		httpfmt.BinaryBadRequest(w, r, "invalid request")
+		return
+	}
 
-	// reverse proxy
+	req = req.WithContext(ctx)
 
-	// defer func(ctx context.Context) {
-	// 	// We'll do clean up in a separate goroutine so the handler can return
-	// 	// once it has read everything it needs from stdout.
-	// 	s.commandsWG.Add(1)
-	// 	go func() {
-	// 		closeFunc(ctx)
-	// 		s.commandsWG.Done()
-	// 	}()
-	// }(ctx)
+	// TODO: reverse proxy
 
-	// // We're writing an encrypted response. Always attempt to add the refund trailer.
-	// w.Header().Add("Trailer", ahttp.NodeRefundAmountHeader)
-	// w.Header().Set("Content-Type", header.MediaType)
+	// for now create a hardcoded response
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: io.NopCloser(strings.NewReader("hello world!")),
+	}
+	encapResp, encapRespMediaType, err := messages.EncapsulateResponse(opener, resp)
+	if err != nil {
+		otelutil.RecordError2(span, fmt.Errorf("failed to encapsulate response: %w", err))
+		httpfmt.BinaryServerError(w, r)
+		return
+	}
 
-	// ctx, copyBodySpan := otelutil.Tracer.Start(ctx, "routercom.generateHandler.copyBody")
-	// if header.IsChunked() {
-	// 	// should already be implied since we're setting a trailer header, but just to be sure.
-	// 	w.Header().Set("Transfer-Encoding", "chunked")
-	// }
-	// _, err = decoder.WriteTo(w)
-	// if err != nil {
-	// 	copyBodySpan.End()
-	// 	slog.ErrorContext(ctx, "failed to write response body", "error", err)
-	// 	otelutil.RecordError2(span, fmt.Errorf("failed to write response body: %w", err))
-	// 	return
-	// }
-	// copyBodySpan.End()
-
-	// s.handleRefundTrailer(ctx, w, decoder)
+	w.Header().Set("Content-Type", encapRespMediaType)
+	w.WriteHeader(http.StatusOK)
+	_, err = io.Copy(w, encapResp)
+	if err != nil {
+		otelutil.RecordError2(span, fmt.Errorf("failed to copy encapsulated response: %w", err))
+		return
+	}
 
 	span.SetStatus(codes.Ok, "")
 }
@@ -243,14 +259,23 @@ type RouterComService struct {
 	base64PubKey     string
 	base64PubKeyName string
 	base64PCRValues  string
+
+	pubKey          kem.PublicKey
+	pubKeyNameBytes []byte
+	pcrValues       map[uint32][]byte
+
+	tpmDevice transport.TPM
 }
 
-func NewRouterCom(cfg *RCSConfig, evidence ev.SignedEvidenceList) (*RouterComService, error) {
+func NewRouterCom(cfg *RCSConfig, evidence ev.SignedEvidenceList, tpmDevice transport.TPM) (*RouterComService, error) {
 	s := &RouterComService{
 		config:     cfg,
 		evidence:   evidence,
 		commandsWG: &sync.WaitGroup{},
+		tpmDevice:  tpmDevice,
 	}
+
+	var pubKeyBytes []byte
 
 	// extract data required by the compute worker from the evidence.
 	for _, item := range s.evidence {
@@ -261,8 +286,8 @@ func NewRouterCom(cfg *RCSConfig, evidence ev.SignedEvidenceList) (*RouterComSer
 				return nil, fmt.Errorf("failed to extract rek public key from evidence: %w", err)
 			}
 
-			s.base64PubKey = base64.StdEncoding.EncodeToString(b)
-			s.base64PubKeyName = base64.StdEncoding.EncodeToString(item.Signature)
+			pubKeyBytes = b
+			s.pubKeyNameBytes = item.Signature
 			continue
 		case ev.TpmQuote:
 			quotePB := ev.TPMQuoteAttestation{}
@@ -271,12 +296,7 @@ func NewRouterCom(cfg *RCSConfig, evidence ev.SignedEvidenceList) (*RouterComSer
 				return nil, fmt.Errorf("failed to unmarshal tpm quote to protobuf: %w", err)
 			}
 
-			b, err := quotePB.PCRValues.MarshalBinary()
-			if err != nil {
-				return nil, fmt.Errorf("failed to marhsal pcr values to binary: %w", err)
-			}
-
-			s.base64PCRValues = base64.StdEncoding.EncodeToString(b)
+			s.pcrValues = quotePB.PCRValues.Values
 			continue
 		case ev.NvidiaCCIntermediateCertificate, ev.NvidiaSwitchIntermediateCertificate:
 			// Extract the intermediate certificate to identify its expiry date.
@@ -316,17 +336,38 @@ func NewRouterCom(cfg *RCSConfig, evidence ev.SignedEvidenceList) (*RouterComSer
 		}
 	}
 
-	if len(s.base64PubKey) == 0 {
+	if len(pubKeyBytes) == 0 {
 		return nil, errors.New("failed to find public key in evidence")
 	}
 
-	if len(s.base64PubKeyName) == 0 {
+	if len(s.pubKeyNameBytes) == 0 {
 		return nil, errors.New("failed to find public key name in evidence")
 	}
 
-	if len(s.base64PCRValues) == 0 {
+	if len(s.pcrValues) == 0 {
 		return nil, errors.New("failed to find pcr values in evidence")
 	}
+
+	kemID, _, _ := tpmhpke.SuiteParams()
+	pubKey, err := kemID.Scheme().UnmarshalBinaryPublicKey(pubKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal public key: %w", err)
+	}
+	s.pubKey = pubKey
+
+	goldenPCRValues := map[uint32][]byte{}
+	for _, pcr := range ev.AttestPCRSelection {
+		if pcr > math.MaxUint32 {
+			return nil, fmt.Errorf("unexpected pcr value %d, does not fit in uint32", pcr)
+		}
+
+		val, ok := s.pcrValues[uint32(pcr)]
+		if !ok {
+			return nil, fmt.Errorf("config is missing pcr value %d", pcr)
+		}
+		goldenPCRValues[uint32(pcr)] = val
+	}
+	s.pcrValues = goldenPCRValues
 
 	setupHandlers(s)
 
@@ -380,4 +421,71 @@ func tpmptToPubKeyBytes(evidence *ev.SignedEvidencePiece) ([]byte, error) {
 	}
 
 	return b, nil
+}
+
+// tpmSuiteAdapter implements twoway.HPKESuite so we can inject our TPM based HPKE receiver
+// into twoway.
+type tpmSuiteAdapter struct {
+	ctx context.Context
+	svc *RouterComService
+}
+
+func newTPMSuiteAdapter(ctx context.Context, s *RouterComService) *tpmSuiteAdapter {
+	return &tpmSuiteAdapter{
+		ctx: ctx,
+		svc: s,
+	}
+}
+
+func (*tpmSuiteAdapter) NewSender(_ kem.PublicKey, _ []byte) (twoway.HPKESender, error) {
+	panic("not implemented")
+}
+
+func (s *tpmSuiteAdapter) NewReceiver(_ kem.PrivateKey, info []byte) (twoway.HPKEReceiver, error) {
+	ecdhZGgenWithTPM := func(keyInfo *tpmhpke.ECDHZGenKeyInfo, pubPoint tpm2.TPM2BECCPoint) ([]byte, error) {
+		// 1. Begin TPM session.
+		_, sessionSpan := otelutil.Tracer.Start(s.ctx, "computeworker.TPMHPKE.beginSession")
+		sess, cleanup, err := opcctpm.PCRPolicySession(s.svc.tpmDevice, s.svc.pcrValues)
+		if err != nil {
+			sessionSpan.End()
+			return nil, fmt.Errorf("failed to create tpm session: %w", err)
+		}
+		sessionSpan.End()
+
+		defer func() {
+			_, span := otelutil.Tracer.Start(s.ctx, "computeworker.TPMHPKE.cleanupSession")
+			defer span.End()
+			err = errors.Join(err, cleanup())
+		}()
+
+		// 3. ECDHZgen
+		_, ecdhZGenSpan := otelutil.Tracer.Start(s.ctx, "computeworker.TPMHPKE.ecdhZGen")
+		b, err := tpmhpke.ECDHZGen(s.svc.tpmDevice, sess, keyInfo, pubPoint)
+		ecdhZGenSpan.End()
+		return b, err
+	}
+
+	receiver := tpmhpke.NewReceiver(s.svc.pubKey, info, &tpmhpke.ECDHZGenKeyInfo{
+		PrivKeyHandle: tpmutil.Handle(s.svc.config.TPM.REKHandle),
+		PublicName: tpm2.TPM2BName{
+			Buffer: s.svc.pubKeyNameBytes,
+		},
+	}, ecdhZGgenWithTPM)
+	return &tpmReceiverAdapter{
+		receiver: receiver,
+	}, nil
+}
+
+func (s *tpmSuiteAdapter) Params() (hpke.KEM, hpke.KDF, hpke.AEAD) {
+	return tpmhpke.SuiteParams()
+}
+
+// tpmReceiverAdapter implements twoway.HPKEReceiver so we can inject our TPM based HPKE Receiver
+// into twoway.
+type tpmReceiverAdapter struct {
+	receiver *tpmhpke.Receiver
+}
+
+func (r *tpmReceiverAdapter) Setup(enc []byte) (twoway.HPKEOpener, error) {
+	return r.receiver.Setup(enc)
 }

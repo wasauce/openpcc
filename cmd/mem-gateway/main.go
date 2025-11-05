@@ -33,7 +33,7 @@ func main() {
 			},
 		},
 		BankURL:   "http://localhost:3500",
-		RouterURL: "http://localhost:3400",
+		RouterURL: "http://localhost:3600",
 	}
 
 	gateway, err := gateway.NewGateway(cfg)

@@ -85,17 +85,19 @@ func run(ctx context.Context) int {
 	// start with default config and override by loading from
 	// YAML file and/or environment.
 	httpConfig := httpapp.DefaultStreamingConfig()
-	httpConfig.Port = "3400"
+	httpConfig.Port = "3600"
 	cfg := &Config{
 		HTTP:            httpConfig,
 		Healthchecker:   health.DefaultCheckerConfig(),
 		HealthGrader:    health.DefaultGraderConfig(),
 		CleanupInterval: time.Second * 30,
 		Anonpay: AnonpayConfig{
-			CreditholeURL: "http://localhost:3600",
+			CreditholeURL: "http://localhost:3501",
 			CurrencyKey:   base64.StdEncoding.EncodeToString(pem.EncodeToMemory(pemBlock)),
 		},
 	}
+
+	cfg.Healthchecker.Interval = 2 * time.Second
 
 	// setup a health grader to evaluate nodes with.
 	grader, err := health.NewGrader(cfg.HealthGrader)
@@ -140,8 +142,13 @@ func run(ctx context.Context) int {
 		return 1
 	}
 
+	// setup router healthchecker that calls the clusterMember
+	healthchecker := health.NewChecker(context.Background(), cfg.Healthchecker, rtr)
+
 	// compose the apps together to run a healthchecking, http serving, cluster member.
-	a := app.NewMulti(httpapp.New(cfg.HTTP, httpHandler))
+	a := app.NewMulti(
+		httpapp.New(cfg.HTTP, httpHandler),
+		healthchecker)
 
 	// run the app until it exits or signals received
 	ctx, _ = signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)

@@ -58,7 +58,7 @@ func run() int {
 	// start with default config and override by loading from
 	// YAML file and/or environment.
 	httpConfig := httpapp.DefaultConfig()
-	httpConfig.Port = "3600"
+	httpConfig.Port = "3501"
 	cfg := &Config{
 		HTTP: httpConfig,
 	}

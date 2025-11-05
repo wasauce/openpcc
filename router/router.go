@@ -100,7 +100,7 @@ func (r *Router) QueryComputeManifests(ctx context.Context, q *api.ComputeManife
 	return manifests
 }
 
-// HealthcheckTargets returns the targets that this router is responsible for healthchecking.
+// QueryHealthcheckTargets returns the targets that this router is responsible for healthchecking.
 func (r *Router) QueryHealthcheckTargets(ctx context.Context) (map[uuid.UUID]url.URL, int) {
 	_, span := otelutil.Tracer.Start(ctx, "router.QueryHealthcheckTargets")
 	defer span.End()

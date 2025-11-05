@@ -78,7 +78,7 @@ func collectEvidence(tpmCfg *TPMConfig, tpmDevice *TPMInMemorySimulator) (ev.Sig
 	result = append(result, rekTPMPTEvidence)
 
 	// Piece 5: Fake attestation.
-	fakeAttestor := attest.NewFakeAttestor([]byte("1234567"))
+	fakeAttestor := attest.NewFakeAttestor([]byte("123456"))
 	fakeEvidence, err := fakeAttestor.CreateSignedEvidence(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create fake evidence: %w", err)
